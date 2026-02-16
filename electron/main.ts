@@ -37,6 +37,10 @@ let currentSettings: AppSettings = {
 }
 let configCache: any = null
 
+// Initialization gate: resolved when initSettings + ensurePhpenv complete
+let resolveInitReady: () => void
+const initReady = new Promise<void>(r => { resolveInitReady = r })
+
 function createWindow() {
   win = new BrowserWindow({
     icon: path.join(process.env.VITE_PUBLIC ?? '', 'electron-vite.svg'),
@@ -249,7 +253,27 @@ async function initSettings() {
   // Docker Check: Runs on every startup to ensure the user is informed if Docker is missing
   console.log('Checking for Docker installation...')
   if (win) win.webContents.send('setup:status', 'Docker の状態を確認中...')
-  const isDockerInstalled = await new Promise<boolean>(r => exec('docker -v', e => r(!e)))
+
+  let isDockerInstalled = await new Promise<boolean>(r => exec('docker -v', e => r(!e)))
+
+  if (!isDockerInstalled && process.platform === 'win32') {
+    console.log('Docker not found in PATH. Checking common installation paths...')
+    const commonPaths = [
+      'C:\\Program Files\\Docker\\Docker\\resources\\bin',
+      'C:\\Program Files\\Docker\\Docker\\resources'
+    ]
+
+    for (const p of commonPaths) {
+      if (existsSync(path.join(p, 'docker.exe'))) {
+        console.log(`Found Docker at ${p}. Adding to PATH.`)
+        process.env.PATH = `${p}${path.delimiter}${process.env.PATH}`
+        // Re-check
+        isDockerInstalled = await new Promise<boolean>(r => exec('docker -v', e => r(!e)))
+        if (isDockerInstalled) break
+      }
+    }
+  }
+
   if (!isDockerInstalled) {
     console.log('Docker not found. Showing warning dialog.')
     await dialog.showMessageBox({
@@ -293,8 +317,12 @@ async function initSettings() {
   }
 
   if (win) win.webContents.send('setup:status', null)
-  await ensureCronDb()
-  await writeCronScripts()
+  try {
+    await ensureCronDb()
+    await writeCronScripts()
+  } catch (e) {
+    console.error('Cron setup failed (non-critical, continuing):', e)
+  }
 }
 
 async function ensureCronDb() {
@@ -443,15 +471,72 @@ app.whenReady().then(async () => {
   createWindow()
   // Wait a bit for window to be ready
   await new Promise(r => setTimeout(r, 1000))
-  await initSettings()
+  try {
+    await initSettings()
+    await ensurePhpenv()
+  } catch (e) {
+    console.error('Initialization failed:', e)
+  } finally {
+    resolveInitReady()
+  }
 })
 
 // --- Logic Helpers ---
 
-async function runWsl(distro: string, cmd: string, asRoot = false): Promise<string> {
+async function ensurePhpenv() {
+  try {
+    const { wsl_distro, phpenv_root } = await ensureConfig()
+    console.log('Checking phpenv installation at:', phpenv_root)
+
+    // Check for git
+    try {
+      await runWsl(wsl_distro, 'git --version')
+    } catch (e) {
+      console.log('git not found. Installing...')
+      if (win) win.webContents.send('setup:status', 'git をインストール中...')
+      // Install git (Oracle Linux uses dnf)
+      try {
+        await runWsl(wsl_distro, 'dnf install -y git', { asRoot: true })
+      } catch (installErr) {
+        console.error('Failed to install git:', installErr)
+        throw new Error('git のインストールに失敗しました。WSL環境を確認してください。')
+      }
+    }
+
+    // Check if phpenv exists
+    try {
+      await runWsl(wsl_distro, `test -f "${phpenv_root}/bin/phpenv"`)
+      console.log('phpenv is already installed.')
+      return
+    } catch (e) {
+      console.log('phpenv not found. Installing...')
+    }
+
+    if (win) win.webContents.send('setup:status', 'phpenv をインストール中...')
+
+    // Install phpenv
+    await runWsl(wsl_distro, `git clone https://github.com/phpenv/phpenv.git "${phpenv_root}"`)
+
+    // Install php-build plugin (needed for 'install' command)
+    await runWsl(wsl_distro, `git clone https://github.com/php-build/php-build.git "${phpenv_root}/plugins/php-build"`)
+
+    console.log('phpenv installation complete.')
+    if (win) win.webContents.send('setup:status', null)
+
+  } catch (e) {
+    console.error('Failed to ensure phpenv:', e)
+    if (win) win.webContents.send('setup:status', 'phpenv のインストールに失敗しました')
+  }
+}
+
+
+async function runWsl(distro: string, cmd: string, options: { asRoot?: boolean; timeout?: number } | boolean = false): Promise<string> {
+  const asRoot = typeof options === 'boolean' ? options : options?.asRoot
+  const timeout = typeof options === 'object' ? options?.timeout : undefined
+
   return new Promise((resolve, reject) => {
     // Debug logging
-    console.log(`[WSL Request] Distro: ${distro}, Cmd: ${cmd}, Root: ${asRoot}`)
+    console.log(`[WSL Request] Distro: ${distro}, Cmd: ${cmd}, Root: ${asRoot}, Timeout: ${timeout}`)
 
     // We will use standard execution but capture stderr explicitly.
     const escapedCmd = cmd.replace(/"/g, '\\"')
@@ -460,12 +545,16 @@ async function runWsl(distro: string, cmd: string, asRoot = false): Promise<stri
     const fullCmd = `wsl -d ${distro} ${userFlag} -- bash -c "${escapedCmd}"`
 
     // Add forcing UTF-8 encoding for child_process
-    exec(fullCmd, { encoding: 'utf8' }, (error, stdout, stderr) => {
+    exec(fullCmd, { encoding: 'utf8', timeout }, (error, stdout, stderr) => {
       if (error) {
         console.error(`[WSL Error] Command: ${fullCmd}`)
         console.error(`[WSL Error] Stderr: ${stderr}`)
         console.error(`[WSL Error] Stdout: ${stdout}`)
-        reject(stderr || error.message)
+        if (error.signal === 'SIGTERM' && timeout) {
+          reject('WSL command timed out')
+        } else {
+          reject(stderr || error.message)
+        }
       } else {
         console.log(`[WSL Success] Output length: ${stdout.length}`)
         resolve(stdout.trim())
@@ -497,7 +586,8 @@ async function ensureConfig() {
 // IPC Handlers
 
 // Get current paths settings
-ipcMain.handle('app:getPaths', () => {
+ipcMain.handle('app:getPaths', async () => {
+  await initReady
   return currentSettings
 })
 
@@ -538,6 +628,7 @@ ipcMain.handle('app:openExternal', (_, url) => {
 })
 
 ipcMain.handle('app:getConfig', async () => {
+  await initReady
   try {
     const cfg = await ensureConfig()
     if (!cfg.wsl_distro || !cfg.phpenv_root) {
@@ -551,6 +642,7 @@ ipcMain.handle('app:getConfig', async () => {
 })
 
 ipcMain.handle('app:getAssignments', async () => {
+  await initReady
   if (!currentSettings.assignmentsPath) return []
   try {
     let data = await readFile(currentSettings.assignmentsPath, 'utf-8')
@@ -686,6 +778,9 @@ ipcMain.handle('phpenv:listVersions', async () => {
     const { wsl_distro, phpenv_root } = await ensureConfig()
     console.log(`Listing versions from ${phpenv_root}/versions/ on ${wsl_distro}`)
 
+    // Ensure versions directory exists
+    await runWsl(wsl_distro, `mkdir -p "${phpenv_root}/versions"`)
+
     const output = await runWsl(wsl_distro, `ls -1v ${phpenv_root}/versions/`)
 
     const versions = output.split('\n')
@@ -696,7 +791,8 @@ ipcMain.handle('phpenv:listVersions', async () => {
     return versions
   } catch (e: any) {
     console.error('List versions failed', e)
-    throw new Error(`List versions failed: ${e.message || e}\nConfig: ${JSON.stringify(configCache)}`)
+    // If the directory is empty, ls may fail - return empty array
+    return []
   }
 })
 
@@ -704,9 +800,11 @@ ipcMain.handle('phpenv:listInstallable', async () => {
   const { wsl_distro, phpenv_root } = await ensureConfig()
   const cmd = `export PHPENV_ROOT='${phpenv_root}'; ${phpenv_root}/bin/phpenv install --list`
   try {
-    const output = await runWsl(wsl_distro, cmd)
+    // Add a 30s timeout to prevent hanging on git operations
+    const output = await runWsl(wsl_distro, cmd, { timeout: 30000 })
     return output.split('\n').map(v => v.trim()).filter(v => /^\d+\.\d+\.\d+$/.test(v)).reverse()
-  } catch (e) {
+  } catch (e: any) {
+    console.error('List installable failed:', e)
     return []
   }
 })
@@ -794,11 +892,7 @@ ipcMain.handle('phpenv:cancelInstall', async () => {
   return false
 })
 
-ipcMain.handle('phpenv:uninstall', async (_, version) => {
-  const { wsl_distro, phpenv_root } = await ensureConfig()
-  const cmd = `rm -rf ${phpenv_root}/versions/${version}`
-  return runWsl(wsl_distro, cmd)
-})
+
 
 ipcMain.handle('fpm:getStatus', async (_, port) => {
   const { wsl_distro } = await ensureConfig()

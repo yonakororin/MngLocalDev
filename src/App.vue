@@ -20,6 +20,7 @@ const status = ref<Record<string, boolean>>({})
 const versionStatus = ref<Record<string, boolean>>({})
 const loading = ref(false)
 const setupStatus = ref<string | null>(null)
+const wslDistros = ref<string[]>([])
 
 // Cron Manager State
 const cronTab = ref('jobs')
@@ -83,12 +84,14 @@ const loadData = async () => {
     }
     status.value = newStatus
     
-    // Check status of versions
     const vStatus: Record<string, boolean> = {}
     for (const v of versions.value) {
       vStatus[v] = await window.ipcRenderer.invoke('fpm:getVersionStatus', v)
     }
     versionStatus.value = vStatus
+
+    const dstrs = await window.ipcRenderer.invoke('app:listWslDistros')
+    wslDistros.value = dstrs
 
     loadCronData()
   } catch (e) {
@@ -1107,8 +1110,14 @@ const selectFile = async (field: 'configPath' | 'assignmentsPath') => {
 const saveSettings = async () => {
   loading.value = true
   try {
-    const ok = await window.ipcRenderer.invoke('app:updatePaths', JSON.parse(JSON.stringify(settings.value)))
-    if(ok) {
+    const okPaths = await window.ipcRenderer.invoke('app:updatePaths', JSON.parse(JSON.stringify(settings.value)))
+    
+    let okConfig = true
+    if (config.value) {
+      okConfig = await window.ipcRenderer.invoke('app:saveConfig', JSON.parse(JSON.stringify(config.value)))
+    }
+
+    if(okPaths && okConfig) {
       alert('Settings saved. reloading...')
       loadData()
     } else {
@@ -1549,6 +1558,17 @@ onUnmounted(() => {
                <input type="text" v-model="settings.assignmentsPath" readonly>
                <button class="btn btn-secondary" @click="selectFile('assignmentsPath')">...</button>
              </div>
+           </div>
+
+           <div v-if="config" style="margin-bottom: 1rem;">
+             <label style="display:block; margin-bottom:0.5rem; color: #333;">WSL Distro</label>
+             <select v-model="config.wsl_distro" style="color: #333; background: #fff; width: 100%; padding: 0.5rem; border-radius: 4px; border: 1px solid #ddd;">
+               <option v-for="d in wslDistros" :key="d" :value="d">{{ d }}</option>
+               <option v-if="wslDistros.length === 0" disabled value="">Distributions not found</option>
+             </select>
+             <small style="color: #666; display: block; margin-top: 0.25rem;">
+               WSL上で動作させるディストリビューションを選択します
+             </small>
            </div>
         </div>
       </div>

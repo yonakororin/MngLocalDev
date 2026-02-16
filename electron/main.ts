@@ -592,11 +592,80 @@ async function ensurePhpenv() {
       } catch (e) { /* ignore */ }
     }
 
+    // Ensure shell initialization (bashrc/zshrc)
+    await ensureShellConfig()
+
+    // Robust dependency check (verify libraries even if deps_installed marker exists)
+    try {
+      if (win) win.webContents.send('setup:status', '互換ライブラリをチェック中...')
+      // Install libtidy and libjpeg-turbo explicitly to ensure they exist
+      await runWsl(wsl_distro, 'dnf install -y libtidy libtidy-devel libjpeg-turbo libjpeg-turbo-devel', { asRoot: true })
+
+      // Create compatibility symlinks for PHP 7.4 on Oracle Linux 9
+      // PHP 7.4 often expects older versioned names for shared libraries
+      const compatibilityCmd = `
+        # libjpeg: 7.4 expects .62, OL9 provides .8
+        if [ ! -f /usr/lib64/libjpeg.so.62 ] && [ -f /usr/lib64/libjpeg.so.8 ]; then
+          ln -s /usr/lib64/libjpeg.so.8 /usr/lib64/libjpeg.so.62
+        fi
+        # libtidy: 7.4 expects .58, OL9 provides .5
+        if [ ! -f /usr/lib64/libtidy.so.58 ] && [ -f /usr/lib64/libtidy.so.5 ]; then
+          ln -s /usr/lib64/libtidy.so.5 /usr/lib64/libtidy.so.58
+        fi
+        # openssl: 7.4 expects .10 or .1.1, OL9 is newer. These might need more care.
+        if [ ! -f /usr/lib64/libcrypto.so.10 ] && [ -f /usr/lib64/libcrypto.so.1.1 ]; then
+          ln -s /usr/lib64/libcrypto.so.1.1 /usr/lib64/libcrypto.so.10
+        fi
+        if [ ! -f /usr/lib64/libssl.so.10 ] && [ -f /usr/lib64/libssl.so.1.1 ]; then
+          ln -s /usr/lib64/libssl.so.1.1 /usr/lib64/libssl.so.10
+        fi
+        ldconfig
+      `
+      await runWsl(wsl_distro, compatibilityCmd, { asRoot: true })
+    } catch (e) {
+      console.warn('Non-critical dependency fix error:', e)
+    }
+
     if (win) win.webContents.send('setup:status', null)
 
   } catch (e) {
     console.error('Failed to ensure phpenv:', e)
     if (win) win.webContents.send('setup:status', 'phpenv のインストールに失敗しました')
+  }
+}
+
+async function ensureShellConfig() {
+  try {
+    const { wsl_distro, phpenv_root } = await ensureConfig()
+    const initMarker = '# --- MngLocalDev: phpenv init'
+    const initBlock = `
+# --- MngLocalDev: phpenv init START ---
+export PHPENV_ROOT="${phpenv_root}"
+if [ -d "$PHPENV_ROOT" ]; then
+    export PATH="$PHPENV_ROOT/bin:$PATH"
+    eval "$(phpenv init -)"
+fi
+# --- MngLocalDev: phpenv init END ---
+`
+
+    const shellConfigs = ['.bashrc', '.zshrc']
+    for (const rc of shellConfigs) {
+      try {
+        const checkExists = await runWsl(wsl_distro, `test -f ~/${rc} && echo "exists" || echo "missing"`)
+        if (checkExists.trim() !== 'exists') continue
+
+        const content = await runWsl(wsl_distro, `cat ~/${rc}`)
+        if (!content.includes(initMarker)) {
+          console.log(`[ShellConfig] Adding phpenv init to ~/${rc}`)
+          const b64 = Buffer.from(initBlock).toString('base64')
+          await runWsl(wsl_distro, `echo "${b64}" | base64 -d >> ~/${rc}`)
+        }
+      } catch (e) {
+        console.warn(`[ShellConfig] Failed to update ~/${rc}:`, e)
+      }
+    }
+  } catch (e) {
+    console.error('Failed to ensure shell config:', e)
   }
 }
 
@@ -713,6 +782,43 @@ ipcMain.handle('app:getConfig', async () => {
     console.error('App GetConfig Error:', e)
     throw e
   }
+})
+
+ipcMain.handle('app:saveConfig', async (_, newConfig: Config) => {
+  if (!currentSettings.configPath) throw new Error('Config path is not set')
+  try {
+    await writeFile(currentSettings.configPath, JSON.stringify(newConfig, null, 2), 'utf-8')
+    configCache = null // clear cache to reload
+    return true
+  } catch (e: any) {
+    console.error('App SaveConfig Error:', e)
+    throw e
+  }
+})
+
+ipcMain.handle('app:listWslDistros', async () => {
+  return new Promise((resolve) => {
+    // wsl -l -q returns names only. 
+    // Note: WSL output can be UTF-16LE, so we need to handle it properly if needed.
+    // exec with { encoding: 'utf16le' } or similar, but often shell behaves okay.
+    exec('wsl -l -q', (err, stdout) => {
+      if (err) {
+        // Fallback for some environments
+        exec('wsl.exe -l -q', (err2, stdout2) => {
+          if (err2) return resolve(['OracleLinux_9_4']) // Default fallback
+          const distros = stdout2.split('\n')
+            .map(s => s.replace(/\u0000/g, '').trim())
+            .filter(s => s.length > 0)
+          resolve(distros)
+        })
+        return
+      }
+      const distros = stdout.split('\n')
+        .map(s => s.replace(/\u0000/g, '').trim())
+        .filter(s => s.length > 0)
+      resolve(distros)
+    })
+  })
 })
 
 ipcMain.handle('app:getAssignments', async () => {

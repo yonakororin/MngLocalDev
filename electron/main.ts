@@ -488,39 +488,83 @@ async function ensurePhpenv() {
     const { wsl_distro, phpenv_root } = await ensureConfig()
     console.log('Checking phpenv installation at:', phpenv_root)
 
-    // Check for git
+    // Check if we already completed dependency setup (use a marker file)
+    const markerFile = `${phpenv_root}/.deps_installed`
+    let depsInstalled = false
     try {
-      await runWsl(wsl_distro, 'git --version')
+      await runWsl(wsl_distro, `test -f "${markerFile}"`)
+      depsInstalled = true
+      console.log(`[Startup] Dependency marker found at ${markerFile}. Skipping dnf install.`)
     } catch (e) {
-      console.log('git not found. Installing...')
-      if (win) win.webContents.send('setup:status', 'git をインストール中...')
-      // Install git (Oracle Linux uses dnf)
+      console.log(`[Startup] Dependency marker not found. Proceeding with dnf install.`)
+    }
+
+    if (!depsInstalled) {
+      if (win) win.webContents.send('setup:status', 'ビルド依存パッケージをインストール中...')
+      console.log('[Startup] Executing dnf install for build dependencies...')
       try {
-        await runWsl(wsl_distro, 'dnf install -y git', { asRoot: true })
+        // Install git, sqlite3, and PHP build dependencies in one go
+        // First enable EPEL for packages like re2c
+        try {
+          await runWsl(wsl_distro, 'dnf install -y epel-release || dnf install -y oracle-epel-release-el9', { asRoot: true })
+        } catch (e) {
+          console.warn('EPEL installation skipped or failed:', e)
+        }
+        const packages = [
+          'git', 'sqlite', 'sqlite-devel', 'bzip2',
+          'gcc', 'gcc-c++', 'make', 'autoconf', 'automake', 'bison', 're2c', 'libtool', 'pkgconfig',
+          'libxml2-devel', 'openssl-devel', 'bzip2-devel', 'curl-devel',
+          'libpng-devel', 'libjpeg-turbo-devel', 'freetype-devel',
+          'gmp-devel', 'readline-devel', 'oniguruma-devel', 'libzip-devel',
+          'libxslt-devel', 'libicu-devel', 'libtidy-devel', 'libwebp-devel', 'libXpm-devel', 'enchant2-devel', 'libsodium-devel'
+        ].join(' ')
+        await runWsl(wsl_distro, `dnf install -y ${packages}`, { asRoot: true })
+        console.log('Build dependencies installed.')
       } catch (installErr) {
-        console.error('Failed to install git:', installErr)
-        throw new Error('git のインストールに失敗しました。WSL環境を確認してください。')
+        console.error('Failed to install build dependencies:', installErr)
+        // Continue anyway - some packages might already be installed
       }
     }
 
     // Check if phpenv exists
+    let phpenvExists = false
     try {
       await runWsl(wsl_distro, `test -f "${phpenv_root}/bin/phpenv"`)
+      phpenvExists = true
       console.log('phpenv is already installed.')
-      return
     } catch (e) {
       console.log('phpenv not found. Installing...')
     }
 
-    if (win) win.webContents.send('setup:status', 'phpenv をインストール中...')
+    if (!phpenvExists) {
+      if (win) win.webContents.send('setup:status', 'phpenv をインストール中...')
 
-    // Install phpenv
-    await runWsl(wsl_distro, `git clone https://github.com/phpenv/phpenv.git "${phpenv_root}"`)
+      // Install phpenv
+      await runWsl(wsl_distro, `git clone https://github.com/phpenv/phpenv.git "${phpenv_root}"`)
 
-    // Install php-build plugin (needed for 'install' command)
-    await runWsl(wsl_distro, `git clone https://github.com/php-build/php-build.git "${phpenv_root}/plugins/php-build"`)
+      // Install php-build plugin (needed for 'install' command)
+      await runWsl(wsl_distro, `git clone https://github.com/php-build/php-build.git "${phpenv_root}/plugins/php-build"`)
 
-    console.log('phpenv installation complete.')
+      console.log('phpenv installation complete.')
+    }
+
+    // Fix CRLF line endings and permissions (critical on /mnt/c/ Windows filesystem)
+    console.log('Fixing script permissions and line endings...')
+    if (win) win.webContents.send('setup:status', 'phpenv スクリプトを修正中...')
+    try {
+      await runWsl(wsl_distro, `find "${phpenv_root}" -type f \\( -name "*.sh" -o -name "phpenv*" -o -name "php-build" -o -name "rbenv*" \\) -exec sed -i 's/\\r$//' {} +`)
+      await runWsl(wsl_distro, `find "${phpenv_root}/bin" "${phpenv_root}/libexec" "${phpenv_root}/plugins" -type f -exec chmod +x {} + 2>/dev/null || true`)
+    } catch (e) {
+      console.warn('Script fix warning (non-critical):', e)
+    }
+
+    // Create marker file to skip dependency check on next startup
+    if (!depsInstalled) {
+      try {
+        await runWsl(wsl_distro, `touch "${markerFile}"`)
+      } catch (e) { /* ignore */ }
+    }
+
     if (win) win.webContents.send('setup:status', null)
 
   } catch (e) {
@@ -536,7 +580,7 @@ async function runWsl(distro: string, cmd: string, options: { asRoot?: boolean; 
 
   return new Promise((resolve, reject) => {
     // Debug logging
-    console.log(`[WSL Request] Distro: ${distro}, Cmd: ${cmd}, Root: ${asRoot}, Timeout: ${timeout}`)
+    // console.log(`[WSL Request] Distro: ${distro}, Cmd: ${cmd}, Root: ${asRoot}, Timeout: ${timeout}`)
 
     // We will use standard execution but capture stderr explicitly.
     const escapedCmd = cmd.replace(/"/g, '\\"')
@@ -556,7 +600,7 @@ async function runWsl(distro: string, cmd: string, options: { asRoot?: boolean; 
           reject(stderr || error.message)
         }
       } else {
-        console.log(`[WSL Success] Output length: ${stdout.length}`)
+        // console.log(`[WSL Success] Output length: ${stdout.length}`)
         resolve(stdout.trim())
       }
     })
@@ -798,7 +842,7 @@ ipcMain.handle('phpenv:listVersions', async () => {
 
 ipcMain.handle('phpenv:listInstallable', async () => {
   const { wsl_distro, phpenv_root } = await ensureConfig()
-  const cmd = `export PHPENV_ROOT='${phpenv_root}'; ${phpenv_root}/bin/phpenv install --list`
+  const cmd = `export PHPENV_ROOT='${phpenv_root}'; bash "${phpenv_root}/bin/phpenv" install --list`
   try {
     // Add a 30s timeout to prevent hanging on git operations
     const output = await runWsl(wsl_distro, cmd, { timeout: 30000 })
@@ -823,16 +867,117 @@ ipcMain.handle('phpenv:install', async (event, version) => {
       throw new Error('Another installation is already in progress.')
     }
 
-    // We use spawn to stream output
-    // Note: phpenv install might spawn sub-processes. Killing the parent wsl process might not kill everything.
-    const cmd = `export PHPENV_ROOT='${phpenv_root}'; source ~/.bashrc 2>/dev/null; ${phpenv_root}/bin/phpenv install ${version}`
+    // Ensure critical build tools and headers are installed before starting
+    try {
+      console.log('[Install] Checking for build tools and headers...')
+      // Check for tools AND the libxml2/tidy library headers via pkg-config
+      await runWsl(wsl_distro, 'which bzip2 make gcc autoconf tar pkg-config && pkg-config --exists libxml-2.0 && pkg-config --exists tidy')
+      console.log('[Install] Build tools and dependencies (libxml2, libtidy) found.')
+    } catch (e) {
+      console.log('[Install] Missing build tools, installing...')
+      sender.send('install:progress', 'ビルドツールをインストール中...\n')
+      try {
+        await runWsl(wsl_distro, 'dnf clean all', { asRoot: true })
+        // Ensure dnf-plugins-core is installed to use config-manager
+        await runWsl(wsl_distro, 'dnf install -y dnf-plugins-core', { asRoot: true })
+
+        await runWsl(wsl_distro, 'dnf install -y epel-release 2>/dev/null || dnf install -y oracle-epel-release-el9 2>/dev/null || true', { asRoot: true })
+
+        // Install bzip2 specifically first to ensure it succeeds
+        console.log('[Install] Installing bzip2...')
+        await runWsl(wsl_distro, 'dnf install -y bzip2', { asRoot: true })
+
+        // Install Development Tools group (compilers, make, etc.)
+        console.log('[Install] Installing Development Tools group...')
+        await runWsl(wsl_distro, 'dnf groupinstall -y "Development Tools"', { asRoot: true })
+
+        // Enable CodeReady Builder (CRB) repo - try multiple potential names for EL9
+        console.log('[Install] Enabling CodeReady Builder repo...')
+        await runWsl(wsl_distro, 'dnf config-manager --set-enabled ol9_codeready_builder || dnf config-manager --set-enabled crb || true', { asRoot: true })
+
+        // Diagnostic: list enabled repos
+        const repos = await runWsl(wsl_distro, 'dnf repolist')
+        console.log('[Install] Enabled repositories:', repos)
+
+        // Install other specific library dependencies including libxml2-devel
+        console.log('[Install] Installing library dependencies...')
+        await runWsl(wsl_distro, 'dnf install -y libxml2-devel openssl-devel bzip2-devel curl-devel libpng-devel libjpeg-turbo-devel freetype-devel gmp-devel readline-devel oniguruma-devel libzip-devel libxslt-devel libicu-devel sqlite sqlite-devel tar re2c libtidy-devel libwebp-devel libXpm-devel enchant2-devel libsodium-devel', { asRoot: true })
+
+        // Verify package availability
+        try {
+          const pkgCheck = await runWsl(wsl_distro, 'dnf list installed libxml2-devel libtidy-devel')
+          console.log('[Install] Dependency status:', pkgCheck)
+        } catch (e) {
+          console.error('[Install] Dependency check failed. Attempting direct install...')
+          await runWsl(wsl_distro, 'dnf install -y libxml2-devel libtidy-devel', { asRoot: true })
+        }
+      } catch (installErr) {
+        console.error('[Install] Failed to install build tools:', installErr)
+        sender.send('install:progress', `ビルドツールのインストールに失敗しました: ${installErr}\n`)
+      }
+    }
+
+    // --- Cleanup stale build environment ---
+    try {
+      console.log('[Install] Cleaning up /tmp/php-build...')
+      await runWsl(wsl_distro, 'rm -rf /tmp/php-build')
+    } catch (e) { /* ignore cleanup errors */ }
+
+    // --- Robust PKG_CONFIG_PATH detection ---
+    let pkgConfigPath = ''
+    try {
+      console.log('[Install] Configuring PKG_CONFIG_PATH...')
+      // Define common pkgconfig directories - RHEL-based systems use lib64 heavily
+      const commonPcDirs = ['/usr/lib64/pkgconfig', '/usr/lib/pkgconfig', '/usr/share/pkgconfig']
+
+      // Verify which ones exist
+      const existingDirs: string[] = []
+      for (const dir of commonPcDirs) {
+        try {
+          await runWsl(wsl_distro, `test -d "${dir}"`)
+          existingDirs.push(dir)
+        } catch (e) { /* ignore missing dirs */ }
+      }
+
+      // Also try to find a specific .pc file to be absolutely sure we have a good path
+      try {
+        const foundPc = await runWsl(wsl_distro, 'find /usr -name libxml-2.0.pc -o -name tidy.pc | head -n 1')
+        if (foundPc && foundPc.trim()) {
+          const foundDir = path.dirname(foundPc.trim()).replace(/\\/g, '/')
+          if (!existingDirs.includes(foundDir)) {
+            existingDirs.push(foundDir)
+          }
+        }
+      } catch (e) { /* ignore search errors */ }
+
+      if (existingDirs.length > 0) {
+        pkgConfigPath = `export PKG_CONFIG_PATH="${existingDirs.join(':')}:$PKG_CONFIG_PATH";`
+        console.log(`[Install] Using PKG_CONFIG_PATH: ${pkgConfigPath}`)
+      } else {
+        console.warn('[Install] No standard pkgconfig directories found.')
+      }
+    } catch (e) {
+      console.warn('[Install] Failed to detect PKG_CONFIG_PATH:', e)
+    }
+
+    // --- Ensure tools are in PATH ---
+    const pathExport = 'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH";'
+
+    // Call php-build directly via bash to avoid execute permission / CRLF issues on /mnt/c/
+    const phpBuildScript = `${phpenv_root}/plugins/php-build/bin/php-build`
+    const installPrefix = `${phpenv_root}/versions/${version}`
+    const cmd = `export PHPENV_ROOT='${phpenv_root}'; ${pkgConfigPath} ${pathExport} bash "${phpBuildScript}" "${version}" "${installPrefix}" 2>&1`
     const wslArgs = ['-d', wsl_distro, '--', 'bash', '-c', cmd]
 
     console.log(`[Install] Spawning: wsl ${wslArgs.join(' ')}`)
 
     const { spawn } = await import('node:child_process')
-    const child = spawn('wsl', wslArgs)
+    const child = spawn('wsl', wslArgs, { shell: true })
     currentInstallProcess = child
+
+    child.on('error', (err) => {
+      console.error(`[Install] Spawn error:`, err)
+    })
 
     child.stdout.on('data', (data) => {
       const line = data.toString()

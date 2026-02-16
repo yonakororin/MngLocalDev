@@ -78,8 +78,26 @@ WSL上のシステムクローン（crontab）をGUIで一括管理します。
 Cron機能を利用するには、WSL2およびCronデーモンが動作している必要があります。
 
 1.  **起動状態の維持**: WSL2は全てのターミナルやアプリケーションを閉じると停止します。停止中はCronジョブも実行されません。
-2.  **Cronの有効化 (OracleLinux等)**:
-    WSL上のターミナルで以下のコマンドを実行して、Cronサービスをインストール・起動してください。
+2.  **systemd の有効化 (推奨)**:
+    WSL2でサービス（CronやMySQL等）を以前のLinuxと同じように自動起動・管理するには、`systemd` を有効にすることを推奨します。
+
+    1. WSL上のターミナルで `/etc/wsl.conf` を作成または編集します:
+       ```bash
+       sudo vi /etc/wsl.conf
+       ```
+    2. 以下の内容を追記して保存します:
+       ```ini
+       [boot]
+       systemd=true
+       ```
+    3. Windowsの PowerShell 等から WSL を再起動して設定を反映させます:
+       ```powershell
+       wsl --shutdown
+       ```
+    これで、`systemctl enable crond` 等の標準的なコマンドが利用可能になります。
+
+3.  **Cronの有効化 (手動)**:
+    systemd を利用しない場合（または古いバージョン等の場合）は、ターミナルで以下を実行してください。
     ```bash
     # インストール (未導入の場合)
     sudo dnf install -y cronie
@@ -87,7 +105,7 @@ Cron機能を利用するには、WSL2およびCronデーモンが動作して�
     # サービスの開始
     sudo crond
     ```
-    ※ WSL2の標準設定ではPC再起動時にCronが自動起動しないため、PC起動後に一度ターミナル等で `sudo crond` を実行する必要があります。
+    ※ systemd 無効時はPC再起動のたびに手動起動が必要です。
 
 ### 4. Docker Manager
 開発環境を支えるコンテナ群の状態管理を行います。

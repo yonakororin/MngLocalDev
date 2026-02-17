@@ -1622,6 +1622,17 @@ ${locationBlocks}
   if (!existsSync(confDir)) mkdirSync(confDir, { recursive: true })
   writeFileSync(path.join(confDir, 'default.conf'), nginxConfig)
 
+  const mysqlConfDir = path.join(composeDir, 'mysql_conf')
+  if (!existsSync(mysqlConfDir)) mkdirSync(mysqlConfDir, { recursive: true })
+  const mysqlConfig = `[mysqld]
+local-infile=1
+[mysql]
+local-infile=1
+[client]
+loose-local-infile=1
+`
+  writeFileSync(path.join(mysqlConfDir, 'local-infile.cnf'), mysqlConfig)
+
   const volumesSection = volumeMappings.length > 0 ? volumeMappings.join('\n') : ''
   const composeContent = `services:
   nginx:
@@ -1639,14 +1650,16 @@ ${volumesSection}
 
   mysql:
     image: mysql:8.0
+    command: --local-infile=1
     container_name: myapp_db
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
       MYSQL_DATABASE: myapp_db
     ports:
-      - "3306:3306"
+      - "3307:3306"
     volumes:
       - ./mysql_data:/var/lib/mysql
+      - ./mysql_conf/local-infile.cnf:/etc/mysql/conf.d/local-infile.cnf
     networks:
       - app_net
 

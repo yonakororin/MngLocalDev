@@ -269,7 +269,7 @@ const editingAssignmentIndex = ref(-1)
 const newAssignment = ref<Assignment>({
   win_path: '',
   php_version: '',
-  port: 8000,
+  port: 9100,
   url_path: 'localhost',
   doc_root: '',
   folder: '',
@@ -288,7 +288,7 @@ const openAssignmentModal = () => {
   }
 
   // If no assignments, default to 9000. Else max + 1
-  const nextPort = maxPort === 0 ? 9000 : maxPort + 1
+  const nextPort = maxPort === 0 ? 9100 : maxPort + 1
 
   newAssignment.value = {
     win_path: '',

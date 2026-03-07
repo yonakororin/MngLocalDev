@@ -20,6 +20,7 @@ const status = ref<Record<string, boolean>>({})
 const versionStatus = ref<Record<string, boolean>>({})
 const loading = ref(false)
 const setupStatus = ref<string | null>(null)
+const wslDistros = ref<string[]>([])
 
 // Cron Manager State
 const cronTab = ref('jobs')
@@ -34,6 +35,7 @@ const showCronEnvModal = ref(false)
 const showCronWrapperModal = ref(false)
 const editingCronItem = ref<any>(null)
 const cronSearchQuery = ref('')
+const cronJobScheduleInput = ref<HTMLInputElement | null>(null)
 
 // Settings
 const settings = ref({
@@ -82,12 +84,14 @@ const loadData = async () => {
     }
     status.value = newStatus
     
-    // Check status of versions
     const vStatus: Record<string, boolean> = {}
     for (const v of versions.value) {
       vStatus[v] = await window.ipcRenderer.invoke('fpm:getVersionStatus', v)
     }
     versionStatus.value = vStatus
+
+    const dstrs = await window.ipcRenderer.invoke('app:listWslDistros')
+    wslDistros.value = dstrs
 
     loadCronData()
   } catch (e) {
@@ -122,6 +126,9 @@ const handleSaveCronJob = async (job: any) => {
         // Auto apply
         const res = await window.ipcRenderer.invoke('cron:apply')
         console.log('App: Cron Apply Result:', res)
+        if (res.success && res.serviceStatus) {
+            console.log('Cron Service Status:', res.serviceStatus)
+        }
     } catch(e: any) { 
         console.error('App: Cron Save/Apply Error:', e)
         alert('Failed to save or apply cron job: ' + e.message) 
@@ -136,9 +143,19 @@ const handleDeleteCronJob = async (id: number) => {
     try {
         await window.ipcRenderer.invoke('cron:deleteJob', id)
         await loadCronData()
-        await window.ipcRenderer.invoke('cron:apply')
+        const res = await window.ipcRenderer.invoke('cron:apply')
+        if (res.success && res.serviceStatus) {
+            console.log('Cron Service Status after delete:', res.serviceStatus)
+        }
     } catch(e: any) { alert(e.message) } finally { loading.value = false }
 }
+
+watch(showCronJobModal, async (val) => {
+    if (val) {
+        await nextTick()
+        cronJobScheduleInput.value?.focus()
+    }
+})
 
 const handleSaveCronEnv = async (env: any) => {
     loading.value = true
@@ -186,8 +203,16 @@ const handleSaveCronSettings = async () => {
     loading.value = true
     try {
         await window.ipcRenderer.invoke('cron:saveSettings', { cronUser: cronData.value.cronUser })
-        await window.ipcRenderer.invoke('cron:apply')
-        alert('Settings saved and applied')
+        const res = await window.ipcRenderer.invoke('cron:apply')
+        await loadCronData()
+        
+        let msg = 'Settings saved and applied.'
+        if (res.serviceStatus && res.serviceStatus.toLowerCase().includes('active: active (running)')) {
+            msg += '\n\n✅ Cron service is running normally.'
+        } else {
+            msg += '\n\n⚠️ Cron service might not be running correctly. See Console for details.'
+        }
+        alert(msg)
     } catch(e: any) { alert(e.message) } finally { loading.value = false }
 }
 
@@ -244,7 +269,7 @@ const editingAssignmentIndex = ref(-1)
 const newAssignment = ref<Assignment>({
   win_path: '',
   php_version: '',
-  port: 8000,
+  port: 9100,
   url_path: 'localhost',
   doc_root: '',
   folder: '',
@@ -263,7 +288,7 @@ const openAssignmentModal = () => {
   }
 
   // If no assignments, default to 9000. Else max + 1
-  const nextPort = maxPort === 0 ? 9000 : maxPort + 1
+  const nextPort = maxPort === 0 ? 9100 : maxPort + 1
 
   newAssignment.value = {
     win_path: '',
@@ -1085,8 +1110,14 @@ const selectFile = async (field: 'configPath' | 'assignmentsPath') => {
 const saveSettings = async () => {
   loading.value = true
   try {
-    const ok = await window.ipcRenderer.invoke('app:updatePaths', JSON.parse(JSON.stringify(settings.value)))
-    if(ok) {
+    const okPaths = await window.ipcRenderer.invoke('app:updatePaths', JSON.parse(JSON.stringify(settings.value)))
+    
+    let okConfig = true
+    if (config.value) {
+      okConfig = await window.ipcRenderer.invoke('app:saveConfig', JSON.parse(JSON.stringify(config.value)))
+    }
+
+    if(okPaths && okConfig) {
       alert('Settings saved. reloading...')
       loadData()
     } else {
@@ -1528,6 +1559,17 @@ onUnmounted(() => {
                <button class="btn btn-secondary" @click="selectFile('assignmentsPath')">...</button>
              </div>
            </div>
+
+           <div v-if="config" style="margin-bottom: 1rem;">
+             <label style="display:block; margin-bottom:0.5rem; color: #333;">WSL Distro</label>
+             <select v-model="config.wsl_distro" style="color: #333; background: #fff; width: 100%; padding: 0.5rem; border-radius: 4px; border: 1px solid #ddd;">
+               <option v-for="d in wslDistros" :key="d" :value="d">{{ d }}</option>
+               <option v-if="wslDistros.length === 0" disabled value="">Distributions not found</option>
+             </select>
+             <small style="color: #666; display: block; margin-top: 0.25rem;">
+               WSL上で動作させるディストリビューションを選択します
+             </small>
+           </div>
         </div>
       </div>
     
@@ -1961,6 +2003,7 @@ onUnmounted(() => {
   </div>
 
     <!-- Cron Job Modal -->
+    <Teleport to="body">
     <div v-if="showCronJobModal" class="modal-overlay">
         <div class="modal">
             <div class="modal-header">
@@ -1970,7 +2013,7 @@ onUnmounted(() => {
             <div class="modal-body" style="padding:20px">
                 <div style="margin-bottom:15px">
                     <label style="display:block; margin-bottom:5px">Schedule (Cron format)</label>
-                    <input type="text" v-model="editingCronItem.schedule" placeholder="* * * * *" style="width:100%" />
+                    <input type="text" ref="cronJobScheduleInput" v-model="editingCronItem.schedule" placeholder="* * * * *" style="width:100%" />
                     <div style="font-size:0.8em; color:#666; margin-top:4px">Min(0-59) Hour(0-23) Day(1-31) Mon(1-12) Week(0-7)</div>
                 </div>
                 <div style="margin-bottom:15px">
@@ -1987,8 +2030,10 @@ onUnmounted(() => {
             </div>
         </div>
     </div>
+    </Teleport>
 
     <!-- Cron Env Modal -->
+    <Teleport to="body">
     <div v-if="showCronEnvModal" class="modal-overlay">
         <div class="modal">
             <div class="modal-header">
@@ -2014,8 +2059,10 @@ onUnmounted(() => {
             </div>
         </div>
     </div>
+    </Teleport>
 
     <!-- Cron Wrapper Modal -->
+    <Teleport to="body">
     <div v-if="showCronWrapperModal" class="modal-overlay">
         <div class="modal">
             <div class="modal-header">
@@ -2041,6 +2088,7 @@ onUnmounted(() => {
             </div>
         </div>
     </div>
+    </Teleport>
 </template>
 
 <style>
@@ -2063,11 +2111,17 @@ onUnmounted(() => {
 /* Modal Styles */
 .modal-overlay {
   position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-  background: rgba(0,0,0,0.5); z-index: 2000; display:flex; align-items:center; justify-content:center;
+  background: rgba(0,0,0,0.5); z-index: 11000; display:flex; align-items:center; justify-content:center;
 }
 .modal {
   background: white; width: 500px; max-height: 80vh; border-radius: 8px; overflow: hidden; display:flex; flex-direction:column;
   box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+  color: #1e293b;
+}
+.modal input, .modal textarea, .modal select {
+  color: #333 !important;
+  background: #fff !important;
+  border: 1px solid #ccc !important;
 }
 .modal-header {
   padding: 1rem; background: #f0f0f0; border-bottom: 1px solid #ddd; display:flex; align-items:center; color: #333;

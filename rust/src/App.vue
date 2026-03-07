@@ -2,8 +2,9 @@
 import { ref, onMounted, onUnmounted, nextTick, watch, computed } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import { Config, Assignment } from './types'
-import { Activity, Server, Database, RefreshCw, Play, Square, Download, Trash2, Plus, Settings, BookOpen, Edit, Eye, Upload, Box, Clock, Layers, ExternalLink } from 'lucide-vue-next'
+import { Activity, Server, Database, RefreshCw, Play, Square, Download, Trash2, Plus, Settings, BookOpen, Edit, Eye, Upload, Box, Clock, Layers, ExternalLink, FileText, Save, FilePlus } from 'lucide-vue-next'
 import { marked } from 'marked'
 import ace from 'ace-builds'
 import 'ace-builds/src-noconflict/mode-mysql'
@@ -984,8 +985,12 @@ const getBrowserUrl = (a: Assignment) => {
   return `http://${host}${pathPart}`
 }
 
-const handleOpenUrl = (url: string) => {
-  invoke('open_external', url)
+const handleOpenUrl = async (url: string) => {
+  try {
+    await openUrl(url)
+  } catch(e) {
+    console.error(e)
+  }
 }
 
 // Couchbase State
@@ -1074,7 +1079,143 @@ watch(activeTab, (newTab) => {
     if (newTab === 'couchbase') {
         loadCouchbaseBuckets()
     }
+    if (newTab === 'nginxconfig') {
+        loadNginxConfigs()
+    }
 })
+
+
+// Nginx Config State
+const nginxConfigFiles = ref<string[]>([])
+const nginxSelectedFile = ref('')
+const nginxConfigContent = ref('')
+const nginxEditorRef = ref<HTMLElement | null>(null)
+let nginxAceEditor: any = null
+const nginxSaving = ref(false)
+const nginxEditorKeybinding = ref('normal')
+
+watch(nginxEditorKeybinding, (val: string) => {
+    if(!nginxAceEditor) return
+    if(val === 'vim') {
+        nginxAceEditor.setKeyboardHandler("ace/keyboard/vim")
+    } else if (val === 'emacs') {
+        nginxAceEditor.setKeyboardHandler("ace/keyboard/emacs")
+    } else {
+        nginxAceEditor.setKeyboardHandler(null)
+    }
+    nginxAceEditor.focus()
+})
+
+const loadNginxConfigs = async () => {
+    try {
+        nginxConfigFiles.value = await invoke('nginx_list_configs')
+    } catch(e) {
+        console.error(e)
+    }
+}
+
+const selectNginxConfig = async (filename: string) => {
+    nginxSelectedFile.value = filename
+    nginxConfigContent.value = 'Loading...'
+    
+    try {
+        const content: string = await invoke('nginx_read_config', { filename })
+        nginxConfigContent.value = content
+        
+        // re-init editor
+        await nextTick()
+        
+        if (nginxAceEditor) {
+             nginxAceEditor.destroy()
+             nginxAceEditor.container.remove()
+             nginxAceEditor = null
+        }
+        
+        if(!nginxEditorRef.value) {
+            console.error("Editor element not found")
+            return
+        }
+        
+        // Re-create the div for Ace editor if we destroyed the previous one
+        if (nginxEditorRef.value.children.length === 0) {
+             const newEl = document.createElement('div')
+             newEl.style.width = '100%'
+             newEl.style.height = '100%'
+             nginxEditorRef.value.appendChild(newEl)
+        }
+        
+        nginxAceEditor = (ace as any).edit(nginxEditorRef.value.children[0] as HTMLElement, {
+            mode: "ace/mode/nginx",
+            theme: "ace/theme/textmate",
+            fontSize: "14px",
+            tabSize: 4,
+            useSoftTabs: true
+        })
+
+        if(nginxEditorKeybinding.value === 'vim') {
+            nginxAceEditor.setKeyboardHandler("ace/keyboard/vim")
+        } else if (nginxEditorKeybinding.value === 'emacs') {
+            nginxAceEditor.setKeyboardHandler("ace/keyboard/emacs")
+        }
+
+        nginxAceEditor.setValue(content, -1)
+        nginxAceEditor.on('change', () => {
+            nginxConfigContent.value = nginxAceEditor.getValue()
+        })
+
+    } catch(e) {
+        console.error(e)
+        alert('Failed to load file: ' + e)
+    }
+}
+
+const saveNginxConfig = async () => {
+    if(!nginxSelectedFile.value) return
+    nginxSaving.value = true
+    try {
+        await invoke('nginx_save_config', {
+            filename: nginxSelectedFile.value,
+            content: nginxConfigContent.value
+        })
+        alert('Config saved and Nginx reloaded successfully.')
+    } catch(e) {
+        console.error(e)
+        alert('Failed to save config: ' + e)
+    } finally {
+        nginxSaving.value = false
+    }
+}
+
+const createNginxConfig = async () => {
+    const filename = prompt('Enter new config filename (e.g. default.conf):')
+    if(filename && filename.trim() !== '') {
+        const validName = filename.trim().endsWith('.conf') ? filename.trim() : filename.trim() + '.conf'
+        
+        try {
+            await invoke('nginx_save_config', {
+                filename: validName,
+                content: '# New Nginx Configuration\n'
+            })
+            await loadNginxConfigs()
+            selectNginxConfig(validName)
+        } catch(e) {
+            alert('Failed to create file: ' + e)
+        }
+    }
+}
+
+const handleNginxReload = async () => {
+    try {
+        await invoke('run_command', {
+            command: 'docker exec localmng-nginx-1 nginx -s reload'
+        })
+        alert('Nginx process reloaded inside container.')
+    } catch(e) {
+        console.error(e)
+        alert('Failed to reload Nginx: ' + e)
+    }
+}
+
 
 // Settings handlers
 const selectFile = async (field: 'configPath' | 'assignmentsPath') => {
@@ -1147,6 +1288,9 @@ onUnmounted(() => {
       <div class="nav-item" :class="{ active: activeTab === 'couchbase' }" @click="activeTab = 'couchbase'">
         <Layers :size="20" /> Couchbase Manager
       </div>
+       <div class="nav-item" :class="{ active: activeTab === 'nginxconfig' }" @click="activeTab = 'nginxconfig'">
+         <FileText :size="20" /> Nginx Config
+       </div>
        <div class="nav-item" :class="{ active: activeTab === 'docker' }" @click="activeTab = 'docker'">
          <Box :size="20" /> Docker Manager
        </div>
@@ -1852,6 +1996,79 @@ onUnmounted(() => {
                                 </button>
                             </div>
                         </div>
+                   </div>
+               </div>
+           </div>
+       </div>
+
+       
+       <!-- Nginx Config Editor -->
+       <div v-if="activeTab === 'nginxconfig'" style="height:100%; display:flex; flex-direction:column;" class="view-nginxconfig">
+           <div class="header">
+               <h2 class="page-title">Nginx Config</h2>
+               <div style="display:flex; gap:10px">
+                   <button class="btn btn-secondary" @click="loadNginxConfigs">
+                       <RefreshCw :size="16" :class="{ 'spin': loading }" /> Reload List
+                   </button>
+                   <button class="btn btn-secondary" @click="handleNginxReload">
+                       <RefreshCw :size="16" /> Nginx Reload
+                   </button>
+                   <button class="btn btn-primary" @click="createNginxConfig">
+                       <FilePlus :size="16" /> New Config
+                   </button>
+               </div>
+           </div>
+
+           <div style="flex:1; display:flex; gap:20px; min-height:0;">
+               <!-- File List -->
+               <div style="width:220px; flex-shrink:0; overflow-y:auto; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-secondary);">
+                   <div v-if="nginxConfigFiles.length === 0" style="padding: 20px; text-align:center; color: var(--text-secondary); font-size: 0.9em;">
+                       No config files found.<br/>Set up your environment first.
+                   </div>
+                   <div v-for="f in nginxConfigFiles" :key="f"
+                        style="padding: 10px 15px; cursor:pointer; border-bottom: 1px solid var(--border-color); display:flex; align-items:center; gap:8px; transition: background 0.15s;"
+                        :style="{ background: nginxSelectedFile === f ? 'var(--accent-color)' : 'transparent', color: nginxSelectedFile === f ? 'white' : 'var(--text-primary)' }"
+                        @click="selectNginxConfig(f)">
+                       <FileText :size="14" />
+                       <span style="font-size: 0.9em; word-break: break-all;">{{ f }}</span>
+                   </div>
+               </div>
+
+               <!-- Editor -->
+               <div style="flex:1; display:flex; flex-direction:column; min-width:0;">
+                   <div v-if="!nginxSelectedFile" style="flex:1; display:flex; align-items:center; justify-content:center; color: var(--text-secondary); font-size: 1.1em; border: 1px dashed var(--border-color); border-radius: 8px;">
+                       <div style="text-align:center;">
+                           <FileText :size="48" style="opacity: 0.3; margin-bottom: 10px;" />
+                           <div>Select a config file to edit</div>
+                       </div>
+                   </div>
+                   <div v-else style="flex:1; display:flex; flex-direction:column; min-height:0;">
+                       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; padding: 8px 12px; background: var(--bg-secondary); border-radius: 6px; border: 1px solid var(--border-color);">
+                           <div style="display:flex; flex-direction:column; gap:4px">
+                               <span style="font-weight:bold; font-size:0.95em; display:flex; align-items:center; gap:6px;">
+                                   <FileText :size="16" style="color: var(--accent-color);" />
+                                   {{ nginxSelectedFile }}
+                               </span>
+                               <span v-if="config?.project_root" style="font-size:0.8em; color: var(--text-secondary); display:flex; flex-direction: column; gap: 4px;">
+                                   <span title="Host Path"><strong>Host:</strong> {{ config.project_root }}\conf.d\{{ nginxSelectedFile }}</span>
+                                   <span title="Container Path"><strong>Container:</strong> /etc/nginx/conf.d/{{ nginxSelectedFile }}</span>
+                               </span>
+                           </div>
+                           <div style="display:flex; align-items:center; gap: 10px;">
+                               <select v-model="nginxEditorKeybinding" style="padding: 4px; border: 1px solid var(--border-color); border-radius: 4px; font-size: 0.85em; background: var(--bg-primary);">
+                                   <option value="normal">Normal</option>
+                                   <option value="vim">Vim</option>
+                                   <option value="emacs">Emacs</option>
+                               </select>
+                               <button class="btn btn-primary" @click="saveNginxConfig" :disabled="nginxSaving" style="padding: 6px 16px;">
+                                   <Save :size="16" />
+                                   {{ nginxSaving ? 'Saving...' : 'Save & Reload' }}
+                               </button>
+                           </div>
+                       </div>
+                       <div ref="nginxEditorRef" style="flex:1; border:1px solid var(--border-color); border-radius: 6px; min-height: 300px; display:flex;">
+                           <div style="width:100%; height:100%;"></div>
+                       </div>
                    </div>
                </div>
            </div>
